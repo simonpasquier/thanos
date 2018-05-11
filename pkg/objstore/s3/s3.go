@@ -5,13 +5,17 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
+	"testing"
 	"time"
 
+	"github.com/improbable-eng/thanos/pkg/objstore"
 	"github.com/minio/minio-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -180,8 +184,7 @@ func (b *Bucket) Exists(ctx context.Context, name string) (bool, error) {
 	b.opsTotal.WithLabelValues(opObjectStat).Inc()
 	_, err := b.client.StatObject(b.bucket, name, minio.StatObjectOptions{})
 	if err != nil {
-		errResponse := minio.ToErrorResponse(err)
-		if errResponse.Code == "NoSuchKey" {
+		if b.IsObjNotFoundErr(err) {
 			return false, nil
 		}
 		return false, errors.Wrap(err, "stat s3 object")
@@ -201,4 +204,58 @@ func (b *Bucket) Upload(ctx context.Context, name string, r io.Reader) error {
 func (b *Bucket) Delete(ctx context.Context, name string) error {
 	b.opsTotal.WithLabelValues(opObjectDelete).Inc()
 	return b.client.RemoveObject(b.bucket, name)
+}
+
+// IsObjNotFoundErr returns true if error means that object is not found. Relevant to Get operations.
+func (b *Bucket) IsObjNotFoundErr(err error) bool {
+	return minio.ToErrorResponse(err).Code == "NoSuchKey"
+}
+
+func configFromEnv() *Config {
+	c := &Config{
+		Bucket:    os.Getenv("S3_BUCKET"),
+		Endpoint:  os.Getenv("S3_ENDPOINT"),
+		AccessKey: os.Getenv("S3_ACCESS_KEY"),
+		SecretKey: os.Getenv("S3_SECRET_KEY"),
+	}
+
+	insecure, err := strconv.ParseBool(os.Getenv("S3_INSECURE"))
+	if err != nil {
+		c.Insecure = insecure
+	}
+	signV2, err := strconv.ParseBool(os.Getenv("S3_SIGNATURE_VERSION2"))
+	if err != nil {
+		c.SignatureV2 = signV2
+	}
+	return c
+}
+
+// NewTestBucket creates test bkt client that before returning creates temporary bucket.
+// In a close function it empties and deletes the bucket.
+func NewTestBucket(t testing.TB, location string) (objstore.Bucket, func(), error) {
+	t.Log("Using test AWS bucket.")
+
+	c := configFromEnv()
+	if err := c.Validate(); err != nil {
+		return nil, nil, err
+	}
+
+	b, err := NewBucket(c, nil, "thanos-e2e-test")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	src := rand.NewSource(time.Now().UnixNano())
+	name := fmt.Sprintf("test_%s_%x", strings.ToLower(t.Name()), src.Int63())
+
+	if err := b.client.MakeBucket(name, location); err != nil {
+		return nil, nil, err
+	}
+
+	return b, func() {
+		objstore.EmptyBucket(t, context.Background(), b)
+		if err := b.client.RemoveBucket(name); err != nil {
+			t.Logf("deleting bucket failed: %s", err)
+		}
+	}, nil
 }
