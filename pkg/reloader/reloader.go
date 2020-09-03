@@ -86,19 +86,18 @@ type Reloader struct {
 	reloadURL     *url.URL
 	cfgFile       string
 	cfgOutputFile string
-	watchedDirs   []string
 	watchInterval time.Duration
 	retryInterval time.Duration
+	watchedDirs   []string
+	watcher       *watcher
 
 	lastCfgHash         []byte
 	lastWatchedDirsHash []byte
 
-	reloads      prometheus.Counter
-	reloadErrors prometheus.Counter
-	watches      prometheus.Gauge
-	watchEvents  prometheus.Counter
-	watchErrors  prometheus.Counter
-	configErrors prometheus.Counter
+	reloads           prometheus.Counter
+	reloadErrors      prometheus.Counter
+	configApplyErrors prometheus.Counter
+	configApply       prometheus.Counter
 }
 
 // Options bundles options for the Reloader.
@@ -114,6 +113,8 @@ type Options struct {
 	CfgOutputFile string
 	// WatchedDirs is a collection of paths for this reloader to watch over.
 	WatchedDirs []string
+	// DelayInterval controls how long the reloader will wait after detecting a file-system event before it applies the reload.
+	DelayInterval time.Duration
 	// WatchInterval controls how often reloader re-reads config and directories.
 	WatchInterval time.Duration
 	// RetryInterval controls how often reloader retries config reload in case of error.
@@ -133,6 +134,7 @@ func New(logger log.Logger, reg prometheus.Registerer, o *Options) *Reloader {
 		reloadURL:     o.ReloadURL,
 		cfgFile:       o.CfgFile,
 		cfgOutputFile: o.CfgOutputFile,
+		watcher:       newWatcher(logger, reg, o.DelayInterval),
 		watchedDirs:   o.WatchedDirs,
 		watchInterval: o.WatchInterval,
 		retryInterval: o.RetryInterval,
@@ -149,37 +151,20 @@ func New(logger log.Logger, reg prometheus.Registerer, o *Options) *Reloader {
 				Help: "Total number of reload requests that failed.",
 			},
 		),
-		configErrors: promauto.With(reg).NewCounter(
+		configApply: promauto.With(reg).NewCounter(
 			prometheus.CounterOpts{
-				Name: "reloader_config_apply_errors_total",
-				Help: "Total number of config applies that failed.",
+				Name: "reloader_config_apply_operations_total",
+				Help: "Total number of config apply operations.",
 			},
 		),
-		watches: promauto.With(reg).NewGauge(
-			prometheus.GaugeOpts{
-				Name: "reloader_watches",
-				Help: "Number of resources watched by the reloader.",
-			},
-		),
-		watchEvents: promauto.With(reg).NewCounter(
+		configApplyErrors: promauto.With(reg).NewCounter(
 			prometheus.CounterOpts{
-				Name: "reloader_watch_events_total",
-				Help: "Total number of events received by the reloader from the watcher.",
-			},
-		),
-		watchErrors: promauto.With(reg).NewCounter(
-			prometheus.CounterOpts{
-				Name: "reloader_watch_errors_total",
-				Help: "Total number of errors received by the reloader from the watcher.",
+				Name: "reloader_config_apply_operations_failed_total",
+				Help: "Total number of config apply operations that failed.",
 			},
 		),
 	}
 	return r
-}
-
-// We cannot detect everything via watch. Watch interval controls how often we re-read given dirs non-recursively.
-func (r *Reloader) WithWatchInterval(duration time.Duration) {
-	r.watchInterval = duration
 }
 
 // Watch starts to watch periodically the config file and directories and process them until the context
@@ -189,16 +174,19 @@ func (r *Reloader) WithWatchInterval(duration time.Duration) {
 // For config file it watches it directly as well via fsnotify.
 // It watches directories as well, but lot's of edge cases are missing, so rely on interval mostly.
 func (r *Reloader) Watch(ctx context.Context) error {
+	if r.cfgFile == "" && len(r.watchedDirs) == 0 {
+		level.Info(r.logger).Log("msg", "nothing to be watched")
+		return nil
+	}
+
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return errors.Wrap(err, "create watcher")
 	}
 	defer runutil.CloseWithLogOnErr(r.logger, watcher, "config watcher close")
 
-	watchables := map[string]struct{}{}
 	if r.cfgFile != "" {
-		watchables[filepath.Dir(r.cfgFile)] = struct{}{}
-		if err := watcher.Add(r.cfgFile); err != nil {
+		if err := r.watcher.addFile(r.cfgFile); err != nil {
 			return errors.Wrapf(err, "add config file %s to watcher", r.cfgFile)
 		}
 
@@ -209,40 +197,37 @@ func (r *Reloader) Watch(ctx context.Context) error {
 
 	// Watch directories in best effort manner.
 	for _, dir := range r.watchedDirs {
-		watchables[filepath.Dir(dir)] = struct{}{}
-		if err := watcher.Add(dir); err != nil {
-			return errors.Wrapf(err, "add dir %s to watcher", dir)
+		if err := r.watcher.addDirectory(dir); err != nil {
+			return errors.Wrapf(err, "add directory %s to watcher", dir)
 		}
 	}
 
-	tick := time.NewTicker(r.watchInterval)
-	defer tick.Stop()
+	go r.watcher.run(ctx)
 
-	r.watches.Set(float64(len(watchables)))
 	level.Info(r.logger).Log(
 		"msg", "started watching config file and directories for changes",
 		"cfg", r.cfgFile,
 		"out", r.cfgOutputFile,
 		"dirs", strings.Join(r.watchedDirs, ","))
 
+	applyCtx, cancel := context.WithTimeout(ctx, r.watchInterval)
 	for {
 		select {
-		case <-ctx.Done():
-			return nil
-		case <-tick.C:
-		case event := <-watcher.Events:
-			r.watchEvents.Inc()
-			if _, ok := watchables[filepath.Dir(event.Name)]; !ok {
-				continue
+		case <-applyCtx.Done():
+			if ctx.Err() != nil {
+				cancel()
+				return nil
 			}
-		case err := <-watcher.Errors:
-			r.watchErrors.Inc()
-			level.Error(r.logger).Log("msg", "watch error", "err", err)
-			continue
+		case <-r.watcher.notify:
 		}
 
-		if err := r.apply(ctx); err != nil {
-			r.configErrors.Inc()
+		// Reset the watch timeout.
+		cancel()
+		applyCtx, cancel = context.WithTimeout(ctx, r.watchInterval)
+
+		r.configApply.Inc()
+		if err := r.apply(applyCtx); err != nil {
+			r.configApplyErrors.Inc()
 			level.Error(r.logger).Log("msg", "apply error", "err", err)
 		}
 	}
@@ -341,11 +326,7 @@ func (r *Reloader) apply(ctx context.Context) error {
 		return nil
 	}
 
-	// Retry trigger reload until it succeeded or next tick is near.
-	retryCtx, cancel := context.WithTimeout(ctx, r.watchInterval)
-	defer cancel()
-
-	if err := runutil.RetryWithLog(r.logger, r.retryInterval, retryCtx.Done(), func() error {
+	if err := runutil.RetryWithLog(r.logger, r.retryInterval, ctx.Done(), func() error {
 		r.reloads.Inc()
 		if err := r.triggerReload(ctx); err != nil {
 			r.reloadErrors.Inc()
@@ -355,7 +336,7 @@ func (r *Reloader) apply(ctx context.Context) error {
 		r.lastCfgHash = cfgHash
 		r.lastWatchedDirsHash = watchedDirsHash
 		level.Info(r.logger).Log(
-			"msg", "Prometheus reload triggered",
+			"msg", "Reload triggered",
 			"cfg_in", r.cfgFile,
 			"cfg_out", r.cfgOutputFile,
 			"watched_dirs", strings.Join(r.watchedDirs, ", "))
@@ -433,4 +414,118 @@ func expandEnv(b []byte) (r []byte, err error) {
 		return []byte(v)
 	})
 	return r, err
+}
+
+type watcher struct {
+	notify chan struct{}
+
+	w           *fsnotify.Watcher
+	watchedDirs map[string]struct{}
+	delayTime   time.Duration
+
+	logger       log.Logger
+	watchedItems prometheus.Gauge
+	watchEvents  prometheus.Counter
+	watchErrors  prometheus.Counter
+}
+
+func newWatcher(logger log.Logger, reg prometheus.Registerer, delayTime time.Duration) *watcher {
+	return &watcher{
+		logger:      logger,
+		delayTime:   delayTime,
+		notify:      make(chan struct{}),
+		watchedDirs: make(map[string]struct{}),
+
+		watchedItems: promauto.With(reg).NewGauge(
+			prometheus.GaugeOpts{
+				Name: "reloader_watches",
+				Help: "Number of resources watched by the reloader.",
+			},
+		),
+		watchEvents: promauto.With(reg).NewCounter(
+			prometheus.CounterOpts{
+				Name: "reloader_watch_events_total",
+				Help: "Total number of events received by the reloader from the watcher.",
+			},
+		),
+		watchErrors: promauto.With(reg).NewCounter(
+			prometheus.CounterOpts{
+				Name: "reloader_watch_errors_total",
+				Help: "Total number of errors received by the reloader from the watcher.",
+			},
+		),
+	}
+}
+
+func (w *watcher) addPath(name string) error {
+	if w.w == nil {
+		fsWatcher, err := fsnotify.NewWatcher()
+		if err != nil {
+			return errors.Wrap(err, "create watcher")
+		}
+		w.w = fsWatcher
+	}
+
+	if err := w.w.Add(name); err != nil {
+		return err
+	}
+
+	w.watchedDirs[name] = struct{}{}
+	w.watchedItems.Set(float64(len(w.watchedDirs)))
+
+	return nil
+}
+
+func (w *watcher) addDirectory(name string) error {
+	w.watchedDirs[name] = struct{}{}
+	return w.addPath(name)
+}
+
+func (w *watcher) addFile(name string) error {
+	w.watchedDirs[filepath.Dir(name)] = struct{}{}
+	return w.addPath(name)
+}
+
+func (w *watcher) run(ctx context.Context) {
+	defer runutil.CloseWithLogOnErr(w.logger, w.w, "config watcher close")
+
+	notify := make(chan struct{})
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-notify:
+				delayCtx, cancel := context.WithTimeout(context.Background(), w.delayTime)
+				select {
+				case <-ctx.Done():
+				case <-delayCtx.Done():
+					select {
+					case w.notify <- struct{}{}:
+					case <-ctx.Done():
+					}
+				}
+				cancel()
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event := <-w.w.Events:
+			w.watchEvents.Inc()
+			if _, ok := w.watchedDirs[filepath.Dir(event.Name)]; ok {
+				select {
+				case notify <- struct{}{}:
+				default:
+				}
+			}
+		case err := <-w.w.Errors:
+			w.watchErrors.Inc()
+			level.Error(w.logger).Log("msg", "watch error", "err", err)
+		}
+	}
 }
