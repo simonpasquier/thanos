@@ -67,6 +67,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -111,13 +112,15 @@ type Options struct {
 	// will be substituted and the output written into the given path. Prometheus should then use
 	// cfgOutputFile as its config file path.
 	CfgOutputFile string
-	// WatchedDirs is a collection of paths for this reloader to watch over.
+	// WatchedDirs is a collection of paths for the reloader to watch over.
 	WatchedDirs []string
-	// DelayInterval controls how long the reloader will wait after detecting a file-system event before it applies the reload.
+	// DelayInterval controls how long the reloader will wait without receiving
+	// new file-system events before it applies the reload.
 	DelayInterval time.Duration
 	// WatchInterval controls how often reloader re-reads config and directories.
 	WatchInterval time.Duration
-	// RetryInterval controls how often reloader retries config reload in case of error.
+	// RetryInterval controls how often the reloader retries a reloading of the
+	// configuration in case the endpoint returned an error.
 	RetryInterval time.Duration
 }
 
@@ -167,12 +170,14 @@ func New(logger log.Logger, reg prometheus.Registerer, o *Options) *Reloader {
 	return r
 }
 
-// Watch starts to watch periodically the config file and directories and process them until the context
-// gets canceled. Config file gets env expanded if cfgOutputFile is specified and reload is trigger if
-// config or directories changed.
-// Watch watchers periodically based on r.watchInterval.
-// For config file it watches it directly as well via fsnotify.
-// It watches directories as well, but lot's of edge cases are missing, so rely on interval mostly.
+// Watch detects any change made to the watched config file and directories. It
+// returns when the context is canceled.
+// Whenever a filesystem change is detected or the watch interval has elapsed,
+// the reloader expands the config file (if cfgOutputFile is specified) and
+// triggers a reload if the configuration file or files in the watched
+// directories have changed.
+// Because some edge cases might be missing, the reloader also relies on the
+// watch interval.
 func (r *Reloader) Watch(ctx context.Context) error {
 	if r.cfgFile == "" && len(r.watchedDirs) == 0 {
 		level.Info(r.logger).Log("msg", "nothing to be watched")
@@ -195,14 +200,19 @@ func (r *Reloader) Watch(ctx context.Context) error {
 		}
 	}
 
-	// Watch directories in best effort manner.
 	for _, dir := range r.watchedDirs {
 		if err := r.watcher.addDirectory(dir); err != nil {
 			return errors.Wrapf(err, "add directory %s to watcher", dir)
 		}
 	}
 
-	go r.watcher.run(ctx)
+	// Start watching the file-system.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		r.watcher.run(ctx)
+		wg.Done()
+	}()
 
 	level.Info(r.logger).Log(
 		"msg", "started watching config file and directories for changes",
@@ -211,11 +221,13 @@ func (r *Reloader) Watch(ctx context.Context) error {
 		"dirs", strings.Join(r.watchedDirs, ","))
 
 	applyCtx, cancel := context.WithTimeout(ctx, r.watchInterval)
+
 	for {
 		select {
 		case <-applyCtx.Done():
 			if ctx.Err() != nil {
 				cancel()
+				wg.Wait()
 				return nil
 			}
 		case <-r.watcher.notify:
@@ -419,9 +431,9 @@ func expandEnv(b []byte) (r []byte, err error) {
 type watcher struct {
 	notify chan struct{}
 
-	w           *fsnotify.Watcher
-	watchedDirs map[string]struct{}
-	delayTime   time.Duration
+	w             *fsnotify.Watcher
+	watchedDirs   map[string]struct{}
+	delayInterval time.Duration
 
 	logger       log.Logger
 	watchedItems prometheus.Gauge
@@ -429,12 +441,12 @@ type watcher struct {
 	watchErrors  prometheus.Counter
 }
 
-func newWatcher(logger log.Logger, reg prometheus.Registerer, delayTime time.Duration) *watcher {
+func newWatcher(logger log.Logger, reg prometheus.Registerer, delayInterval time.Duration) *watcher {
 	return &watcher{
-		logger:      logger,
-		delayTime:   delayTime,
-		notify:      make(chan struct{}),
-		watchedDirs: make(map[string]struct{}),
+		logger:        logger,
+		delayInterval: delayInterval,
+		notify:        make(chan struct{}),
+		watchedDirs:   make(map[string]struct{}),
 
 		watchedItems: promauto.With(reg).NewGauge(
 			prometheus.GaugeOpts{
@@ -489,24 +501,53 @@ func (w *watcher) addFile(name string) error {
 func (w *watcher) run(ctx context.Context) {
 	defer runutil.CloseWithLogOnErr(w.logger, w.w, "config watcher close")
 
+	var wg sync.WaitGroup
 	notify := make(chan struct{})
 
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
+
+		var (
+			delayCtx context.Context
+			cancel   context.CancelFunc
+		)
+
 		for {
 			select {
 			case <-ctx.Done():
+				if cancel != nil {
+					cancel()
+				}
 				return
+
 			case <-notify:
-				delayCtx, cancel := context.WithTimeout(context.Background(), w.delayTime)
-				select {
-				case <-ctx.Done():
-				case <-delayCtx.Done():
+				if cancel != nil {
+					cancel()
+				}
+
+				delayCtx, cancel = context.WithCancel(ctx)
+
+				wg.Add(1)
+				go func(ctx context.Context) {
+					defer wg.Done()
+
+					if w.delayInterval > 0 {
+						t := time.NewTicker(w.delayInterval)
+						defer t.Stop()
+
+						select {
+						case <-ctx.Done():
+							return
+						case <-t.C:
+						}
+					}
+
 					select {
 					case w.notify <- struct{}{}:
 					case <-ctx.Done():
 					}
-				}
-				cancel()
+				}(delayCtx)
 			}
 		}
 	}()
@@ -514,7 +555,9 @@ func (w *watcher) run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			wg.Wait()
 			return
+
 		case event := <-w.w.Events:
 			w.watchEvents.Inc()
 			if _, ok := w.watchedDirs[filepath.Dir(event.Name)]; ok {
@@ -523,6 +566,7 @@ func (w *watcher) run(ctx context.Context) {
 				default:
 				}
 			}
+
 		case err := <-w.w.Errors:
 			w.watchErrors.Inc()
 			level.Error(w.logger).Log("msg", "watch error", "err", err)
